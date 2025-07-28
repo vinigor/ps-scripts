@@ -14,7 +14,7 @@ function Install-CpuZ {
         return $false
     }
     
-    # Try Winget first
+    # Try Winget first (left as-is)
     try {
         Write-Host "Attempting to install CPU-Z via Winget..."
         winget install --id CPUID.CPU-Z -e --source winget -h
@@ -45,36 +45,80 @@ function Install-CpuZ {
     }
 }
 
-# Gathers CPU information by running CPU-Z and parsing its TXT report
-function Get-CpuInfoFromCpuZ {
+# Generates a single CPU-Z TXT report and returns its content.
+# Shows a lightweight progress spinner while waiting for the file to appear.
+function Invoke-CpuZReport {
     if (-not (Install-CpuZ)) {
-        Write-Error "CPU-Z is not installed and cannot be installed automatically"
-        return $null
+        throw "CPU-Z is not installed and cannot be installed automatically"
     }
-    
-    $cpuZPath = "C:\Program Files\CPUID\CPU-Z\cpuz.exe"
-    $reportName = "cpuz_report"
-    $reportPath = Join-Path $env:TEMP $reportName
-    
-    # Remove any previous reports
-    if (Test-Path "$reportPath.txt") { Remove-Item "$reportPath.txt" -Force }
-    if (Test-Path "$reportPath.TXT") { Remove-Item "$reportPath.TXT" -Force }
-    
-    # Run CPU-Z to generate the report
-    $process = Start-Process -FilePath $cpuZPath -ArgumentList "-txt=$reportPath" -Wait -PassThru -WindowStyle Hidden
-    Start-Sleep -Seconds 2
-    
-    # Locate the resulting report (case-insensitive extension)
-    $finalReportPath = if (Test-Path "$reportPath.txt") { "$reportPath.txt" }
-    elseif (Test-Path "$reportPath.TXT") { "$reportPath.TXT" }
-    else {
-        Write-Error "Failed to create CPU-Z report"
-        return $null
+
+    $cpuZPath    = "C:\Program Files\CPUID\CPU-Z\cpuz.exe"
+    $reportBase  = Join-Path $env:TEMP ("cpuz_report_" + ([guid]::NewGuid().Guid))
+    $lowerPath   = "$reportBase.txt"
+    $upperPath   = "$reportBase.TXT"
+
+    if (Test-Path $lowerPath) { Remove-Item $lowerPath -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $upperPath) { Remove-Item $upperPath -Force -ErrorAction SilentlyContinue }
+
+    # Kick off CPU-Z report generation
+    Start-Process -FilePath $cpuZPath -ArgumentList "-txt=$reportBase" -WindowStyle Hidden | Out-Null
+
+    # Wait for the file to appear (polling, no hard sleep)
+    $spinner = @('|','/','-','\')
+    $idx = 0
+    $timeoutSec = 12
+    $start = Get-Date
+
+    while (-not (Test-Path $lowerPath) -and -not (Test-Path $upperPath)) {
+        $elapsed = (Get-Date) - $start
+        if ($elapsed.TotalSeconds -ge $timeoutSec) {
+            Write-Host "`rGenerating CPU-Z report... timeout after $timeoutSec s" 
+            throw "CPU-Z report was not created in time"
+        }
+        Write-Host -NoNewline ("`rGenerating CPU-Z report... " + $spinner[$idx % $spinner.Length])
+        $idx++
+        Start-Sleep -Milliseconds 150
     }
-    
-    $reportContent = Get-Content $finalReportPath -Raw
-    
-    # === CPU parsing (unchanged logic) ===
+    Write-Host ("`rGenerating CPU-Z report... done".PadRight(60))
+
+    $final = if (Test-Path $lowerPath) { $lowerPath } else { $upperPath }
+    $content = Get-Content $final -Raw
+
+    # Cleanup
+    Remove-Item $final -Force -ErrorAction SilentlyContinue
+    return $content
+}
+
+# Parses CPU and Memory from a given CPU-Z report (unchanged logic, just parameterized)
+function Get-CpuInfoFromCpuZ {
+    param(
+        [string]$ReportContent  # When provided, we parse it directly (no re-run of CPU-Z)
+    )
+
+    # If report is not provided, fall back to legacy behavior (single-run inside)
+    if (-not $ReportContent) {
+        # Legacy path (kept as-is)
+        $cpuZPath = "C:\Program Files\CPUID\CPU-Z\cpuz.exe"
+        if (-not (Install-CpuZ)) {
+            Write-Error "CPU-Z is not installed and cannot be installed automatically"
+            return $null
+        }
+        $reportName = "cpuz_report"
+        $reportPath = Join-Path $env:TEMP $reportName
+        if (Test-Path "$reportPath.txt") { Remove-Item "$reportPath.txt" -Force }
+        if (Test-Path "$reportPath.TXT") { Remove-Item "$reportPath.TXT" -Force }
+        $process = Start-Process -FilePath $cpuZPath -ArgumentList "-txt=$reportPath" -Wait -PassThru -WindowStyle Hidden
+        Start-Sleep -Seconds 2
+        $finalReportPath = if (Test-Path "$reportPath.txt") { "$reportPath.txt" }
+                           elseif (Test-Path "$reportPath.TXT") { "$reportPath.TXT" }
+                           else { Write-Error "Failed to create CPU-Z report"; return $null }
+        $ReportContent = Get-Content $finalReportPath -Raw
+        Remove-Item $finalReportPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $reportContent = $ReportContent
+
+    # === CPU parsing (unchanged) ===
     $result = [PSCustomObject]@{
         Sockets    = 0
         P_Cores    = 0
@@ -86,41 +130,32 @@ function Get-CpuInfoFromCpuZ {
         SocketType = ""
     }
     
-    # Global counts
     if ($reportContent -match "Number of sockets\s+(\d+)") {
         $result.Sockets = [int]$matches[1]
     }
     if ($reportContent -match "Number of threads\s+(\d+)") {
         $result.Threads = [int]$matches[1]
     }
-    
-    # Extract the first "Socket N" CPU info block
     if ($reportContent -match "Processors Information[\s-]+(Socket \d+\s+ID = \d+[\s\S]+?)(?=\n\s{2,}\S+|\z)") {
         $cpuInfo = $matches[1]
-        
-        # CPU Name
         if ($cpuInfo -match "Name\s+(.+)") {
             $result.Name = $matches[1].Trim()
         }
-        # Socket type (“Socket 1700 LGA” → “1700 LGA”, “Socket AM5 (LGA1718)” → “AM5”)
         if ($cpuInfo -match 'Package(?:\s*\([^)]+\))?\s+Socket\s+([^(\r\n]+)') {
             $result.SocketType = $matches[1].Trim()
         }
-        # Hybrid (Intel P/E-cores)
         if ($cpuInfo -match "Core Set 0\s+P-Cores, (\d+) cores") {
             $result.P_Cores = [int]$matches[1]
         }
         if ($cpuInfo -match "Core Set 1\s+E-Cores, (\d+) cores") {
             $result.E_Cores = [int]$matches[1]
         }
-        # Non-hybrid (AMD/Xeon) — do not divide by sockets
         if ($cpuInfo -match "Number of cores\s+(\d+)") {
             $cores = [int]$matches[1]
             if ($result.P_Cores -eq 0 -and $result.E_Cores -eq 0) {
                 $result.P_Cores = $cores
             }
         }
-        # Frequencies (marketing/base/max)
         if ($cpuInfo -match "(?:Stock frequency|Base frequency \(cores\))\s+(\d+) MHz") {
             $baseFreq = [decimal]$matches[1] / 1000
             $result.BaseFreq = $baseFreq.ToString("0.0").Replace(".", ",")
@@ -131,16 +166,15 @@ function Get-CpuInfoFromCpuZ {
         }
     }
 
-    # === MEMORY parsing (more robust; avoids false "mixed") ===
+    # === MEMORY parsing (robust; avoids false "mixed") ===
     $memoryInfo = [PSCustomObject]@{
-        TotalGB     = 0           # Sum of installed module capacities
-        Config      = ""          # e.g., "4×48 GB DDR5-5600 MHz" or "... (mixed)"
-        TotalSlots  = 0           # Across all DMI Physical Memory Arrays
-        UsedSlots   = 0           # Count of installed modules
-        RawModules  = @()         # Per-module raw info
+        TotalGB     = 0
+        Config      = ""
+        TotalSlots  = 0
+        UsedSlots   = 0
+        RawModules  = @()
     }
 
-    # Capture all "DMI Memory Device" blocks (tolerant to whitespace)
     $memoryBlocks = [regex]::Matches(
         $reportContent,
         '(?s)^DMI Memory Device\s*\r?\n(.*?)(?:\r?\n\r?\n)',
@@ -153,123 +187,77 @@ function Get-CpuInfoFromCpuZ {
 
     foreach ($m in $memoryBlocks) {
         $blockText = $m.Groups[1].Value
-
         $module = [ordered]@{
             SizeGB      = 0
             Type        = ''
             SpeedMHz    = 0
             IsInstalled = $false
         }
-
-        # Installed module has an explicit numeric "size <N> GB"
         if ($blockText -match '(?mi)^\s*size\s+(\d+)\s*GB') {
             $module.SizeGB   = [int]$matches[1]
             $module.IsInstalled = $true
             $totalSizeGB     += $module.SizeGB
             $usedSlots++
         }
-
-        # Normalize type: trim and uppercase (e.g., "DDR5")
         if ($blockText -match '(?mi)^\s*type\s+([^\r\n]+)') {
             $module.Type = ($matches[1] -replace '\s+',' ').Trim().ToUpperInvariant()
         }
-
-        # Speed: integer in MHz; keep 0 if not present
         if ($blockText -match '(?mi)^\s*speed\s+(\d+)\s*MHz') {
             $module.SpeedMHz = [int]$matches[1]
         }
-
         $modules += [pscustomobject]$module
     }
 
-    # Sum "max# of devices" across all "DMI Physical Memory Array" blocks
     $arrayMatches = [regex]::Matches(
         $reportContent,
         '(?mis)^DMI Physical Memory Array\s+.*?^\s*max# of devices\s+(\d+)',
         [System.Text.RegularExpressions.RegexOptions]::Multiline
     )
-    $memoryInfo.TotalSlots = (
+    $totalSlots = (
         $arrayMatches |
         ForEach-Object { [int]$_.Groups[1].Value } |
         Measure-Object -Sum
     ).Sum
 
-    # Build configuration string based on installed modules
     $installed = $modules | Where-Object { $_.IsInstalled }
-
+    $config = ""
     if ($installed.Count -gt 0) {
-        # Unique groups (ignore zero speeds to avoid false "mixed")
         $sizesUnique  = $installed | Select-Object -ExpandProperty SizeGB     | Sort-Object -Unique
         $typesUnique  = $installed | Select-Object -ExpandProperty Type       | Sort-Object -Unique
         $speedsUnique = $installed | Where-Object { $_.SpeedMHz -gt 0 } | Select-Object -ExpandProperty SpeedMHz | Sort-Object -Unique
 
         $allSameSize  = $sizesUnique.Count  -eq 1
         $allSameType  = $typesUnique.Count  -eq 1 -and $typesUnique[0]
-        $allSameSpeed = $speedsUnique.Count -le 1  # <=1 means all equal or all missing/zero
+        $allSameSpeed = $speedsUnique.Count -le 1  # <=1 means equal or missing
 
-        # Representative type/speed
-        $repType  = $typesUnique | Select-Object -First 1
+        $repType  = $typesUnique  | Select-Object -First 1
         $repSpeed = $speedsUnique | Select-Object -First 1
 
         if ($allSameSize -and $allSameType -and $allSameSpeed) {
-            # Example: "4×48 GB DDR5-3600 MHz"
-            $memoryInfo.Config = ("{0}×{1} GB {2}{3}" -f
+            $config = ("{0}×{1} GB {2}{3}" -f
                 $installed.Count,
                 $sizesUnique[0],
                 $repType,
                 ($(if ($repSpeed) { "-$repSpeed MHz" } else { "" }))
             ).Trim()
-        }
-        else {
-            # Mixed sizes/types/speeds → show grouped sizes and tag as mixed
+        } else {
             $sizeGroups = $installed | Group-Object SizeGB | ForEach-Object { "{0}×{1} GB" -f $_.Count, $_.Name }
             $suffixType = if ($repType) { " $repType" } else { "" }
-            $memoryInfo.Config = (($sizeGroups -join " + ") + "$suffixType (mixed)").Trim()
+            $config = (($sizeGroups -join " + ") + "$suffixType (mixed)").Trim()
         }
 
-        # ECC tag if any array reports ECC correction
         $hasECC = [regex]::IsMatch($reportContent, '(?mi)^\s*DMI Physical Memory Array\s+.*^\s*correction\s+.*ECC')
-        if ($hasECC) {
-            $memoryInfo.Config += " ECC"
-        }
+        if ($hasECC) { $config += " ECC" }
     }
 
-    # Finalize memory info object
-    $memoryInfo.TotalGB   = [int]$totalSizeGB
-    $memoryInfo.UsedSlots = [int]$usedSlots
-    $memoryInfo.RawModules= $modules
+    $memoryInfo.TotalGB    = [int]$totalSizeGB
+    $memoryInfo.UsedSlots  = [int]$usedSlots
+    $memoryInfo.TotalSlots = [int]$totalSlots
+    $memoryInfo.Config     = $config
+    $memoryInfo.RawModules = $modules
 
-    # Attach memory info to the main result
     $result | Add-Member -NotePropertyName "MemoryInfo" -NotePropertyValue $memoryInfo
-
-    # Cleanup temp report
-    Remove-Item $finalReportPath -Force -ErrorAction SilentlyContinue
-    
     return $result
-}
-
-# Returns a fresh CPU-Z TXT report content; does not modify your CPU parsing functions
-function Get-CpuZReportRaw {
-    $cpuZPath = "C:\Program Files\CPUID\CPU-Z\cpuz.exe"
-    if (-not (Test-Path $cpuZPath)) { return $null }
-
-    $reportName = "cpuz_report_drives"
-    $reportPath = Join-Path $env:TEMP $reportName
-
-    if (Test-Path "$reportPath.txt") { Remove-Item "$reportPath.txt" -Force }
-    if (Test-Path "$reportPath.TXT") { Remove-Item "$reportPath.TXT" -Force }
-
-    Start-Process -FilePath $cpuZPath -ArgumentList "-txt=$reportPath" -Wait -WindowStyle Hidden | Out-Null
-    Start-Sleep -Seconds 1
-
-    $final = if (Test-Path "$reportPath.txt") { "$reportPath.txt" }
-             elseif (Test-Path "$reportPath.TXT") { "$reportPath.TXT" }
-             else { $null }
-    if (-not $final) { return $null }
-
-    $content = Get-Content $final -Raw
-    Remove-Item $final -Force -ErrorAction SilentlyContinue
-    return $content
 }
 
 # Parses "Drive ..." blocks from CPU-Z report and returns ONLY virtual drives
@@ -304,16 +292,9 @@ function Get-VirtualDrivesFromCpuZ {
         if ($block -match '(?mi)^\s*Bus Type\s+([^\r\n]+)') { $bus = $matches[1].Trim() }
         if ($block -match '(?mi)^\s*Type\s+([^\r\n]+)')     { $dtype = $matches[1].Trim() }
 
-        # Vendor/marker keywords that strongly indicate virtual disks
         $isVirtual = ($name -match '(?i)\b(QEMU|VBOX|VMWARE|VIRTIO|HYPER-V|KVM|MSFT VIRTUAL|VIRTUAL)\b')
-
         if ($isVirtual) {
-            $sizeStr = if ($capacityGB -ge 1000) {
-                ("{0:N1} TB" -f ($capacityGB/1000))
-            } else {
-                ("{0:N1} GB" -f $capacityGB)
-            }
-
+            $sizeStr = if ($capacityGB -ge 1000) { ("{0:N1} TB" -f ($capacityGB/1000)) } else { ("{0:N1} GB" -f $capacityGB) }
             $virtual += [pscustomobject]@{
                 IsVirtual = $true
                 MediaType = 'VIRTUAL'
@@ -329,9 +310,12 @@ function Get-VirtualDrivesFromCpuZ {
 # Builds a list of physical disks from Get-PhysicalDisk, excluding obvious virtual models
 function Get-PhysicalDrivesList {
     $list = @()
+    try {
+        $pd = Get-PhysicalDisk
+    } catch {
+        return $list
+    }
 
-    # Fallback to FriendlyName if Model is not present on this system
-    $pd = Get-PhysicalDisk
     foreach ($d in $pd) {
         $model = if ($d.PSObject.Properties.Name -contains 'Model' -and $d.Model) { $d.Model }
                  elseif ($d.FriendlyName) { $d.FriendlyName }
@@ -344,11 +328,7 @@ function Get-PhysicalDrivesList {
         $type  = if ($d.MediaType) { $d.MediaType } else { 'Unspecified' }
         $bytes = $d.Size
 
-        $sizeStr = if ($bytes -ge 1e12) {
-            "{0:N1} TB" -f ($bytes/1e12)
-        } else {
-            "{0:N1} GB" -f ($bytes/1e9)
-        }
+        $sizeStr = if ($bytes -ge 1e12) { "{0:N1} TB" -f ($bytes/1e12) } else { "{0:N1} GB" -f ($bytes/1e9) }
 
         $list += [pscustomobject]@{
             IsVirtual = $false
@@ -362,15 +342,10 @@ function Get-PhysicalDrivesList {
 
 # Extracts Windows Version from CPU-Z report; falls back to registry when absent
 function Get-WindowsVersionString {
-    param(
-        [string]$ReportContent
-    )
-    # Try CPU-Z line
+    param([string]$ReportContent)
     if ($ReportContent -and ($ReportContent -match '(?mi)^\s*Windows\s+Version\s+(.+)$')) {
         return $matches[1].Trim()
     }
-
-    # Fallback: registry -> "Windows 11 Pro 23H2 (22631.XXXX)"
     try {
         $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
         $product = $cv.ProductName
@@ -385,8 +360,6 @@ function Get-WindowsVersionString {
     }
 }
 
-
-
 # Refreshes current PowerShell process environment variables from registry
 function Refresh-Environment {
     foreach($level in "Machine","User") {
@@ -400,72 +373,47 @@ function Refresh-Environment {
     }
 }
 
-# Main: run, format, and print
+# -------------------------
+# Main: single CPU-Z run
+# -------------------------
 try {
-    $cpuInfo = Get-CpuInfoFromCpuZ
-    
+    # Single report for everything (CPU, RAM, virtual drives, Windows version)
+    $cpuzRaw = Invoke-CpuZReport
+
+    # CPU + RAM
+    $cpuInfo = Get-CpuInfoFromCpuZ -ReportContent $cpuzRaw
     if ($cpuInfo) {
-        # CPU cores string (e.g., "2x28P+0E" or "2x28")
-        $coreInfo = if ($cpuInfo.E_Cores -gt 0) {
-            "$($cpuInfo.Sockets)x$($cpuInfo.P_Cores)P+$($cpuInfo.E_Cores)E"
-        } else {
-            "$($cpuInfo.Sockets)x$($cpuInfo.P_Cores)"
-        }
-        
-        # CPU frequency string (e.g., "3,4/5,6GHz" or "3,4GHz")
-        $freqInfo = if ($cpuInfo.BaseFreq -and $cpuInfo.MaxFreq) {
-            "$($cpuInfo.BaseFreq)/$($cpuInfo.MaxFreq)GHz"
-        } elseif ($cpuInfo.BaseFreq) {
-            "$($cpuInfo.BaseFreq)GHz"
-        } elseif ($cpuInfo.MaxFreq) {
-            "?/$($cpuInfo.MaxFreq)GHz"
-        } else {
-            ""
-        }
-        
-        # CPU line
-        "$($cpuInfo.Name.Trim()) | $coreInfo $($cpuInfo.Threads) | $freqInfo | $($cpuInfo.SocketType)"
-        
-        # Memory line
+        $coreInfo = if ($cpuInfo.E_Cores -gt 0) { "$($cpuInfo.Sockets)x$($cpuInfo.P_Cores)P+$($cpuInfo.E_Cores)E" } else { "$($cpuInfo.Sockets)x$($cpuInfo.P_Cores)" }
+        $freqInfo = if ($cpuInfo.BaseFreq -and $cpuInfo.MaxFreq) { "$($cpuInfo.BaseFreq)/$($cpuInfo.MaxFreq)GHz" }
+                    elseif ($cpuInfo.BaseFreq) { "$($cpuInfo.BaseFreq)GHz" }
+                    elseif ($cpuInfo.MaxFreq) { "?/$($cpuInfo.MaxFreq)GHz" }
+                    else { "" }
+        Write-Output "$($cpuInfo.Name.Trim()) | $coreInfo $($cpuInfo.Threads) | $freqInfo | $($cpuInfo.SocketType)"
+
         $mem = $cpuInfo.MemoryInfo
         if ($mem.TotalSlots -gt 0) {
-            "$($mem.TotalGB) GB ($($mem.Config)) in $($mem.TotalSlots) slots, $($mem.UsedSlots) used"
-        }
-        else {
-            "$($mem.TotalGB) GB ($($mem.Config))"
+            Write-Output "$($mem.TotalGB) GB ($($mem.Config)) in $($mem.TotalSlots) slots, $($mem.UsedSlots) used"
+        } else {
+            Write-Output "$($mem.TotalGB) GB ($($mem.Config))"
         }
     }
-    # Fetch CPU-Z report once for disks + Windows Version
-$cpuzRaw = Get-CpuZReportRaw
 
-# Build lists
-$physDisks = Get-PhysicalDrivesList
-$virtDisks = @()
-if ($cpuzRaw) {
+    # Disks: physical (PS) + virtual (CPU-Z)
+    $physDisks = Get-PhysicalDrivesList
     $virtDisks = Get-VirtualDrivesFromCpuZ -ReportContent $cpuzRaw
-}
+    $allDisks  = $physDisks + $virtDisks
 
-# Merge: physical first, then virtual
-$allDisks = @()
-$allDisks += $physDisks
-$allDisks += $virtDisks
+    $i = 1
+    $diskLines = $allDisks | ForEach-Object { "{0}. {1} {2} {3}" -f $i++, $_.MediaType, $_.Model, $_.Size }
+    if ($diskLines) {
+        Write-Output ($diskLines -join ' | ')
+    }
 
-# One-line disk summary: "1. TYPE MODEL SIZE | 2. ..."
-$i = 1
-$diskLines = $allDisks | ForEach-Object { "{0}. {1} {2} {3}" -f $i++, $_.MediaType, $_.Model, $_.Size }
-$disksOneLine = ($diskLines -join ' | ')
-
-# Print disks line
-if ($disksOneLine) {
-    $disksOneLine
-}
-
-# Windows Version
-$winVer = Get-WindowsVersionString -ReportContent $cpuzRaw
-if ($winVer) {
-    "Windows Version: $winVer"
-}
-
+    # Windows Version
+    $winVer = Get-WindowsVersionString -ReportContent $cpuzRaw
+    if ($winVer) {
+        Write-Output "Windows Version: $winVer"
+    }
 } catch {
     Write-Error "Error: $_"
 }
