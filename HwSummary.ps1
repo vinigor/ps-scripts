@@ -1,4 +1,4 @@
-﻿# Checks and installs prerequisites (CPU‑Z) if needed
+# Checks and installs prerequisites (CPU‑Z) if needed
 function Install-CpuZ {
     $cpuZPath = "C:\Program Files\CPUID\CPU-Z\cpuz.exe"
     
