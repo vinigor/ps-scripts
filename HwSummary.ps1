@@ -441,7 +441,7 @@ try {
         # Windows Version
         $winVer = Get-WindowsVersionString -ReportContent $cpuzRaw
         if ($winVer) {
-            "Windows Version: $winVer"
+            "$winVer"
         }
     }
 } catch {
