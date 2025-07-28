@@ -248,6 +248,145 @@ function Get-CpuInfoFromCpuZ {
     return $result
 }
 
+# Returns a fresh CPU-Z TXT report content; does not modify your CPU parsing functions
+function Get-CpuZReportRaw {
+    $cpuZPath = "C:\Program Files\CPUID\CPU-Z\cpuz.exe"
+    if (-not (Test-Path $cpuZPath)) { return $null }
+
+    $reportName = "cpuz_report_drives"
+    $reportPath = Join-Path $env:TEMP $reportName
+
+    if (Test-Path "$reportPath.txt") { Remove-Item "$reportPath.txt" -Force }
+    if (Test-Path "$reportPath.TXT") { Remove-Item "$reportPath.TXT" -Force }
+
+    Start-Process -FilePath $cpuZPath -ArgumentList "-txt=$reportPath" -Wait -WindowStyle Hidden | Out-Null
+    Start-Sleep -Seconds 1
+
+    $final = if (Test-Path "$reportPath.txt") { "$reportPath.txt" }
+             elseif (Test-Path "$reportPath.TXT") { "$reportPath.TXT" }
+             else { $null }
+    if (-not $final) { return $null }
+
+    $content = Get-Content $final -Raw
+    Remove-Item $final -Force -ErrorAction SilentlyContinue
+    return $content
+}
+
+# Parses "Drive ..." blocks from CPU-Z report and returns ONLY virtual drives
+function Get-VirtualDrivesFromCpuZ {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ReportContent
+    )
+
+    $virtual = @()
+    if (-not $ReportContent) { return $virtual }
+
+    $driveMatches = [regex]::Matches(
+        $ReportContent,
+        '(?ms)^Drive\s+[^\r\n]+\r?\n(.*?)(?=^Drive\s+|\z)',
+        [System.Text.RegularExpressions.RegexOptions]::Multiline
+    )
+
+    foreach ($m in $driveMatches) {
+        $block = $m.Groups[1].Value
+
+        $name = ''
+        $capacityGB = $null
+        $bus = ''
+        $dtype = ''
+
+        if ($block -match '(?mi)^\s*Name\s+([^\r\n]+)') { $name = $matches[1].Trim() }
+        if ($block -match '(?mi)^\s*Capacity\s+([\d\.,]+)\s*GB') {
+            $capStr = $matches[1].Replace(',', '.')
+            $capacityGB = [double]::Parse($capStr, [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        if ($block -match '(?mi)^\s*Bus Type\s+([^\r\n]+)') { $bus = $matches[1].Trim() }
+        if ($block -match '(?mi)^\s*Type\s+([^\r\n]+)')     { $dtype = $matches[1].Trim() }
+
+        # Vendor/marker keywords that strongly indicate virtual disks
+        $isVirtual = ($name -match '(?i)\b(QEMU|VBOX|VMWARE|VIRTIO|HYPER-V|KVM|MSFT VIRTUAL|VIRTUAL)\b')
+
+        if ($isVirtual) {
+            $sizeStr = if ($capacityGB -ge 1000) {
+                ("{0:N1} TB" -f ($capacityGB/1000))
+            } else {
+                ("{0:N1} GB" -f $capacityGB)
+            }
+
+            $virtual += [pscustomobject]@{
+                IsVirtual = $true
+                MediaType = 'VIRTUAL'
+                Model     = $name
+                Size      = $sizeStr
+                BusType   = $bus
+            }
+        }
+    }
+    return $virtual
+}
+
+# Builds a list of physical disks from Get-PhysicalDisk, excluding obvious virtual models
+function Get-PhysicalDrivesList {
+    $list = @()
+
+    # Fallback to FriendlyName if Model is not present on this system
+    $pd = Get-PhysicalDisk
+    foreach ($d in $pd) {
+        $model = if ($d.PSObject.Properties.Name -contains 'Model' -and $d.Model) { $d.Model }
+                 elseif ($d.FriendlyName) { $d.FriendlyName }
+                 else { '' }
+
+        # Skip items that look virtual to avoid duplicating CPU-Z-derived entries
+        $looksVirtual = ($model -match '(?i)\b(QEMU|VBOX|VMWARE|VIRTIO|HYPER-V|KVM|MSFT VIRTUAL|VIRTUAL)\b')
+        if ($looksVirtual) { continue }
+
+        $type  = if ($d.MediaType) { $d.MediaType } else { 'Unspecified' }
+        $bytes = $d.Size
+
+        $sizeStr = if ($bytes -ge 1e12) {
+            "{0:N1} TB" -f ($bytes/1e12)
+        } else {
+            "{0:N1} GB" -f ($bytes/1e9)
+        }
+
+        $list += [pscustomobject]@{
+            IsVirtual = $false
+            MediaType = $type
+            Model     = $model
+            Size      = $sizeStr
+        }
+    }
+    return $list
+}
+
+# Extracts Windows Version from CPU-Z report; falls back to registry when absent
+function Get-WindowsVersionString {
+    param(
+        [string]$ReportContent
+    )
+    # Try CPU-Z line
+    if ($ReportContent -and ($ReportContent -match '(?mi)^\s*Windows\s+Version\s+(.+)$')) {
+        return $matches[1].Trim()
+    }
+
+    # Fallback: registry -> "Windows 11 Pro 23H2 (22631.XXXX)"
+    try {
+        $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+        $product = $cv.ProductName
+        $display = $cv.DisplayVersion
+        if (-not $display) { $display = $cv.ReleaseId }
+        $build   = $cv.CurrentBuild
+        $ubr     = $cv.UBR
+        $buildStr = if ($ubr -ge 0) { "$build.$ubr" } else { "$build" }
+        return "$product $display ($buildStr)"
+    } catch {
+        return ""
+    }
+}
+
+
+
 # Refreshes current PowerShell process environment variables from registry
 function Refresh-Environment {
     foreach($level in "Machine","User") {
@@ -296,6 +435,37 @@ try {
             "$($mem.TotalGB) GB ($($mem.Config))"
         }
     }
+    # Fetch CPU-Z report once for disks + Windows Version
+$cpuzRaw = Get-CpuZReportRaw
+
+# Build lists
+$physDisks = Get-PhysicalDrivesList
+$virtDisks = @()
+if ($cpuzRaw) {
+    $virtDisks = Get-VirtualDrivesFromCpuZ -ReportContent $cpuzRaw
+}
+
+# Merge: physical first, then virtual
+$allDisks = @()
+$allDisks += $physDisks
+$allDisks += $virtDisks
+
+# One-line disk summary: "1. TYPE MODEL SIZE | 2. ..."
+$i = 1
+$diskLines = $allDisks | ForEach-Object { "{0}. {1} {2} {3}" -f $i++, $_.MediaType, $_.Model, $_.Size }
+$disksOneLine = ($diskLines -join ' | ')
+
+# Print disks line
+if ($disksOneLine) {
+    $disksOneLine
+}
+
+# Windows Version
+$winVer = Get-WindowsVersionString -ReportContent $cpuzRaw
+if ($winVer) {
+    "Windows Version: $winVer"
+}
+
 } catch {
     Write-Error "Error: $_"
 }
