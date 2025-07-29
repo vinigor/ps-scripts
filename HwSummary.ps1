@@ -3,9 +3,7 @@ function Install-CpuZ {
     $cpuZPath = "C:\Program Files\CPUID\CPU-Z\cpuz.exe"
     
     # Fast path: CPU-Z is already installed in the default location
-    if (Test-Path $cpuZPath) {
-        return $true
-    }
+    if (Test-Path $cpuZPath) { return $true }
     
     # Admin rights are required for installing software
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -18,9 +16,7 @@ function Install-CpuZ {
     try {
         Write-Host "Attempting to install CPU-Z via Winget..."
         winget install --id CPUID.CPU-Z -e --source winget -h
-        if (Test-Path $cpuZPath) {
-            return $true
-        }
+        if (Test-Path $cpuZPath) { return $true }
     } catch {
         Write-Warning "Winget is not available, falling back to Chocolatey..."
     }
@@ -77,7 +73,7 @@ function Get-CpuInfoFromCpuZ {
     # Store the raw report before parsing
     $rawReport = $reportContent
     
-    # === CPU parsing (unchanged logic) ===
+    # === CPU parsing ===
     $result = [PSCustomObject]@{
         Sockets    = 0
         P_Cores    = 0
@@ -110,18 +106,12 @@ function Get-CpuInfoFromCpuZ {
             $result.SocketType = $matches[1].Trim()
         }
         # Hybrid (Intel P/E-cores)
-        if ($cpuInfo -match "Core Set 0\s+P-Cores, (\d+) cores") {
-            $result.P_Cores = [int]$matches[1]
-        }
-        if ($cpuInfo -match "Core Set 1\s+E-Cores, (\d+) cores") {
-            $result.E_Cores = [int]$matches[1]
-        }
+        if ($cpuInfo -match "Core Set 0\s+P-Cores, (\d+) cores") { $result.P_Cores = [int]$matches[1] }
+        if ($cpuInfo -match "Core Set 1\s+E-Cores, (\d+) cores") { $result.E_Cores = [int]$matches[1] }
         # Non-hybrid (AMD/Xeon) — do not divide by sockets
         if ($cpuInfo -match "Number of cores\s+(\d+)") {
             $cores = [int]$matches[1]
-            if ($result.P_Cores -eq 0 -and $result.E_Cores -eq 0) {
-                $result.P_Cores = $cores
-            }
+            if ($result.P_Cores -eq 0 -and $result.E_Cores -eq 0) { $result.P_Cores = $cores }
         }
         # Frequencies (marketing/base/max)
         if ($cpuInfo -match "(?:Stock frequency|Base frequency \(cores\))\s+(\d+) MHz") {
@@ -134,16 +124,15 @@ function Get-CpuInfoFromCpuZ {
         }
     }
 
-    # === MEMORY parsing (more robust; avoids false "mixed") ===
+    # === MEMORY parsing (robust) ===
     $memoryInfo = [PSCustomObject]@{
-        TotalGB     = 0           # Sum of installed module capacities
-        Config      = ""          # e.g., "4×48 GB DDR5-5600 MHz" or "... (mixed)"
-        TotalSlots  = 0           # Across all DMI Physical Memory Arrays
-        UsedSlots   = 0           # Count of installed modules
-        RawModules  = @()         # Per-module raw info
+        TotalGB     = 0
+        Config      = ""
+        TotalSlots  = 0
+        UsedSlots   = 0
+        RawModules  = @()
     }
 
-    # Capture all "DMI Memory Device" blocks (tolerant to whitespace)
     $memoryBlocks = [regex]::Matches(
         $reportContent,
         '(?s)^DMI Memory Device\s*\r?\n(.*?)(?:\r?\n\r?\n)',
@@ -164,20 +153,15 @@ function Get-CpuInfoFromCpuZ {
             IsInstalled = $false
         }
 
-        # Installed module has an explicit numeric "size <N> GB"
         if ($blockText -match '(?mi)^\s*size\s+(\d+)\s*GB') {
             $module.SizeGB   = [int]$matches[1]
             $module.IsInstalled = $true
             $totalSizeGB     += $module.SizeGB
             $usedSlots++
         }
-
-        # Normalize type: trim and uppercase (e.g., "DDR5")
         if ($blockText -match '(?mi)^\s*type\s+([^\r\n]+)') {
             $module.Type = ($matches[1] -replace '\s+',' ').Trim().ToUpperInvariant()
         }
-
-        # Speed: integer in MHz; keep 0 if not present
         if ($blockText -match '(?mi)^\s*speed\s+(\d+)\s*MHz') {
             $module.SpeedMHz = [int]$matches[1]
         }
@@ -185,7 +169,6 @@ function Get-CpuInfoFromCpuZ {
         $modules += [pscustomobject]$module
     }
 
-    # Sum "max# of devices" across all "DMI Physical Memory Array" blocks
     $arrayMatches = [regex]::Matches(
         $reportContent,
         '(?mis)^DMI Physical Memory Array\s+.*?^\s*max# of devices\s+(\d+)',
@@ -197,11 +180,8 @@ function Get-CpuInfoFromCpuZ {
         Measure-Object -Sum
     ).Sum
 
-    # Build configuration string based on installed modules
     $installed = $modules | Where-Object { $_.IsInstalled }
-
     if ($installed.Count -gt 0) {
-        # Unique groups (ignore zero speeds to avoid false "mixed")
         $sizesUnique  = $installed | Select-Object -ExpandProperty SizeGB     | Sort-Object -Unique
         $typesUnique  = $installed | Select-Object -ExpandProperty Type       | Sort-Object -Unique
         $speedsUnique = $installed | Where-Object { $_.SpeedMHz -gt 0 } | Select-Object -ExpandProperty SpeedMHz | Sort-Object -Unique
@@ -210,34 +190,26 @@ function Get-CpuInfoFromCpuZ {
         $allSameType  = $typesUnique.Count  -eq 1 -and $typesUnique[0]
         $allSameSpeed = $speedsUnique.Count -le 1  # <=1 means all equal or all missing/zero
 
-        # Representative type/speed
         $repType  = $typesUnique | Select-Object -First 1
         $repSpeed = $speedsUnique | Select-Object -First 1
 
         if ($allSameSize -and $allSameType -and $allSameSpeed) {
-            # Example: "4×48 GB DDR5-3600 MHz"
             $memoryInfo.Config = ("{0}×{1} GB {2}{3}" -f
                 $installed.Count,
                 $sizesUnique[0],
                 $repType,
                 ($(if ($repSpeed) { "-$repSpeed MHz" } else { "" }))
             ).Trim()
-        }
-        else {
-            # Mixed sizes/types/speeds → show grouped sizes and tag as mixed
+        } else {
             $sizeGroups = $installed | Group-Object SizeGB | ForEach-Object { "{0}×{1} GB" -f $_.Count, $_.Name }
             $suffixType = if ($repType) { " $repType" } else { "" }
             $memoryInfo.Config = (($sizeGroups -join " + ") + "$suffixType (mixed)").Trim()
         }
 
-        # ECC tag if any array reports ECC correction
         $hasECC = [regex]::IsMatch($reportContent, '(?mi)^\s*DMI Physical Memory Array\s+.*^\s*correction\s+.*ECC')
-        if ($hasECC) {
-            $memoryInfo.Config += " ECC"
-        }
+        if ($hasECC) { $memoryInfo.Config += " ECC" }
     }
 
-    # Finalize memory info object
     $memoryInfo.TotalGB   = [int]$totalSizeGB
     $memoryInfo.UsedSlots = [int]$usedSlots
     $memoryInfo.RawModules= $modules
@@ -248,7 +220,6 @@ function Get-CpuInfoFromCpuZ {
 
     # Cleanup temp report
     Remove-Item $finalReportPath -Force -ErrorAction SilentlyContinue
-    
     return $result
 }
 
@@ -342,15 +313,10 @@ function Get-PhysicalDrivesList {
 
 # Extracts Windows Version from CPU-Z report; falls back to registry when absent
 function Get-WindowsVersionString {
-    param(
-        [string]$ReportContent
-    )
-    # Try CPU-Z line
+    param([string]$ReportContent)
     if ($ReportContent -and ($ReportContent -match '(?mi)^\s*Windows\s+Version\s+(.+)$')) {
         return $matches[1].Trim()
     }
-
-    # Fallback: registry -> "Windows 11 Pro 23H2 (22631.XXXX)"
     try {
         $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
         $product = $cv.ProductName
@@ -360,9 +326,36 @@ function Get-WindowsVersionString {
         $ubr     = $cv.UBR
         $buildStr = if ($ubr -ge 0) { "$build.$ubr" } else { "$build" }
         return "$product $display ($buildStr)"
-    } catch {
-        return ""
+    } catch { return "" }
+}
+
+# Parses motherboard model:
+# - Prefer "model" from DMI Baseboard
+# - Fallback to "product" from DMI System Information
+function Get-MotherboardModelFromCpuZ {
+    param([Parameter(Mandatory=$true)][string]$ReportContent)
+
+    if (-not $ReportContent) { return "" }
+
+    # Try Baseboard block
+    $bb = [regex]::Match($ReportContent, '(?ms)^DMI Baseboard\s*\r?\n(.*?)(?:\r?\n\r?\n)')
+    if ($bb.Success) {
+        $block = $bb.Groups[1].Value
+        if ($block -match '(?mi)^\s*model\s+(.+)$') {
+            return ($matches[1] -replace '\s+',' ').Trim()
+        }
     }
+
+    # Fallback: System Information → product
+    $sys = [regex]::Match($ReportContent, '(?ms)^DMI System Information\s*\r?\n(.*?)(?:\r?\n\r?\n)')
+    if ($sys.Success) {
+        $block = $sys.Groups[1].Value
+        if ($block -match '(?mi)^\s*product\s+(.+)$') {
+            return ($matches[1] -replace '\s+',' ').Trim()
+        }
+    }
+
+    return ""
 }
 
 # Refreshes current PowerShell process environment variables from registry
@@ -403,46 +396,37 @@ try {
         
         # CPU line
         "$($cpuInfo.Name.Trim()) | $coreInfo $($cpuInfo.Threads) | $freqInfo | $($cpuInfo.SocketType)"
-        
+
+        # Motherboard line (2nd)
+        $cpuzRaw = $cpuInfo.RawReport
+        $mbModel = Get-MotherboardModelFromCpuZ -ReportContent $cpuzRaw
+        if ($mbModel) { $mbModel }
+
         # Memory line
         $mem = $cpuInfo.MemoryInfo
         if ($mem.TotalSlots -gt 0) {
             "$($mem.TotalGB) GB ($($mem.Config)) in $($mem.TotalSlots) slots, $($mem.UsedSlots) used"
-        }
-        else {
+        } else {
             "$($mem.TotalGB) GB ($($mem.Config))"
         }
-        
-        # Use the stored raw report from $cpuInfo instead of generating a new one
-        $cpuzRaw = $cpuInfo.RawReport
-        
-        # Build lists
+
+        # Disks
         $physDisks = Get-PhysicalDrivesList
         $virtDisks = @()
-        if ($cpuzRaw) {
-            $virtDisks = Get-VirtualDrivesFromCpuZ -ReportContent $cpuzRaw
-        }
+        if ($cpuzRaw) { $virtDisks = Get-VirtualDrivesFromCpuZ -ReportContent $cpuzRaw }
 
-        # Merge: physical first, then virtual
         $allDisks = @()
         $allDisks += $physDisks
         $allDisks += $virtDisks
 
-        # One-line disk summary: "1. TYPE MODEL SIZE | 2. ..."
         $i = 1
         $diskLines = $allDisks | ForEach-Object { "{0}. {1} {2} {3}" -f $i++, $_.MediaType, $_.Model, $_.Size }
         $disksOneLine = ($diskLines -join ' | ')
-
-        # Print disks line
-        if ($disksOneLine) {
-            $disksOneLine
-        }
+        if ($disksOneLine) { $disksOneLine }
 
         # Windows Version
         $winVer = Get-WindowsVersionString -ReportContent $cpuzRaw
-        if ($winVer) {
-            "$winVer"
-        }
+        if ($winVer) { "$winVer" }
     }
 } catch {
     Write-Error "Error: $_"
